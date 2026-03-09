@@ -1,0 +1,17 @@
+[project]
+name = "gitlab2jira"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "python-gitlab",
+    "jira",
+    "emoji",
+    "mistletoe",
+]
+
+[project.scripts]
+gitlab2jira = "gitlab2jira:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
