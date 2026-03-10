@@ -18,7 +18,10 @@ Usage:
       --jira-api-token YOUR_JIRA_API_TOKEN \
       --jira-project-key PROJ \
       [--jira-epic-key EPIC-123] \
-      [--mapping-file issue_mapping.json]
+      [--mapping-file issue_mapping.json] \
+      [--skip-labels LABEL [LABEL ...] | --include-labels-only LABEL [LABEL ...]] \
+      [--mark-migrated] \
+      [--close-issues]
 """
 
 import html
@@ -303,7 +306,11 @@ class GitLabToJiraMigrator:
                  jira_epic_key=None,
                  gitlab_project_id=None,
                  gitlab_group_id=None,
-                 mapping_file="issue_mapping.json"):
+                 mapping_file="issue_mapping.json",
+                 skip_labels=None,
+                 include_labels_only=None,
+                 mark_migrated=False,
+                 close_issues=False):
         """
         Initialize the migrator.
 
@@ -333,12 +340,17 @@ class GitLabToJiraMigrator:
         else:
             raise ValueError("Either --gitlab-project-id or --gitlab-group-id must be provided.")
         logger.info("Connecting to Jira...")
+        self.jira_url = jira_url.rstrip('/')
         jira_options = {"server": jira_url}
         self.jira = JIRA(jira_options, basic_auth=(jira_user, jira_api_token))
         self.jira_project_key = jira_project_key
         self.jira_epic_key = jira_epic_key
         self.mapping_file = mapping_file
         self.issue_mapping = load_mapping(mapping_file)
+        self.skip_labels = set(skip_labels or [])
+        self.include_labels_only = set(include_labels_only or [])
+        self.mark_migrated = mark_migrated
+        self.close_issues = close_issues
 
     def get_jira_account_id_by_email(self, email):
         """
@@ -476,7 +488,7 @@ class GitLabToJiraMigrator:
     def determine_parent_from_links(self, gitlab_issue, project):
         """
         Determine if the GitLab issue is a sub-task by checking the links API.
-        
+
         :param gitlab_issue: GitLab issue object.
         :param project: GitLab project object.
         :return: The parent issue's IID if found, otherwise None.
@@ -633,7 +645,7 @@ class GitLabToJiraMigrator:
             if final_description.strip():
                 final_description += "\n\n"
             final_description += "\n\n".join(additional_description)
-        desc_jira = self.convert_markdown_to_jira(final_description)
+        desc_jira = markdown_to_jira(final_description)
         # Truncate description if it exceeds Jira's limit and append a link to the original issue
         MAX_DESCRIPTION_LENGTH = 32767
         if len(desc_jira) > MAX_DESCRIPTION_LENGTH:
@@ -652,7 +664,7 @@ class GitLabToJiraMigrator:
         if hasattr(gitlab_issue, "author") and gitlab_issue.author:
             try:
                 user = self.gitlab.users.get(gitlab_issue.author['id'])
-                gitlab_reporter_email = user.email
+                gitlab_reporter_email = user.public_email or user.username
                 logger.info(f"Reporter email: {gitlab_reporter_email}")
                 jira_reporter = self.get_jira_account_id_by_email(gitlab_reporter_email)
                 if jira_reporter:
@@ -667,7 +679,7 @@ class GitLabToJiraMigrator:
         if hasattr(gitlab_issue, "assignee") and gitlab_issue.assignee:
             try:
                 user = self.gitlab.users.get(gitlab_issue.assignee['id'])
-                gitlab_assignee_email = user.email
+                gitlab_assignee_email = user.public_email or user.username
                 logger.info(f"Assignee email: {gitlab_assignee_email}")
                 jira_assignee = self.get_jira_account_id_by_email(gitlab_assignee_email)
                 if jira_assignee:
@@ -718,7 +730,7 @@ class GitLabToJiraMigrator:
             logger.info(f"Issue {new_issue.key} is already in '{desired_status}' state; no transition needed.")
         # Process attachments in the description
         replaced_md = self._replace_and_upload_attachments_in_md(new_issue.key, final_description, project)
-        final_desc_jira = self.convert_markdown_to_jira(replaced_md)
+        final_desc_jira = markdown_to_jira(replaced_md)
         final_desc_jira = html.unescape(final_desc_jira)
         if len(final_desc_jira) > MAX_DESCRIPTION_LENGTH:
             logger.warning(f"Final description for {new_issue.key} exceeds limit. Truncating.")
@@ -757,7 +769,7 @@ class GitLabToJiraMigrator:
             author = note.author["name"]
             original_body = html.unescape(note.body or "")
             replaced_md = self._replace_and_upload_attachments_in_md(jira_issue_key, original_body, project)
-            replaced_jira = self.convert_markdown_to_jira(replaced_md)
+            replaced_jira = markdown_to_jira(replaced_md)
             final_comment_body = f"*{author} wrote:*\n\n{replaced_jira}"
             if len(final_comment_body) > MAX_COMMENT_LENGTH:
                 logger.warning(f"Comment from {author} exceeds maximum length, truncating.")
@@ -774,6 +786,41 @@ class GitLabToJiraMigrator:
                 logger.info(f"Comment migrated from {author}: {original_body[:50]}...")
             except Exception as e:
                 logger.error(f"Error migrating comment from {author}: {e}", exc_info=True)
+
+    def mark_gitlab_issue_as_migrated(self, gitlab_issue, project, jira_key):
+        """
+        Mark a GitLab issue as migrated by adding a comment with the Jira link
+        and applying the 'imported-to-jira' label.
+
+        :param gitlab_issue: GitLab issue object.
+        :param project: GitLab project object.
+        :param jira_key: The Jira issue key the issue was migrated to.
+        """
+        jira_url = f"{self.jira_url}/browse/{jira_key}"
+        try:
+            issue = project.issues.get(gitlab_issue.iid)
+            issue.notes.create({"body": f"Migrated to Jira: {jira_url}"})
+            updated_labels = list(set(issue.labels) | {"imported-to-jira"})
+            issue.labels = updated_labels
+            issue.save()
+            logger.info(f"Marked GitLab issue #{gitlab_issue.iid} as migrated (label + comment).")
+        except Exception as e:
+            logger.error(f"Error marking GitLab issue #{gitlab_issue.iid} as migrated: {e}", exc_info=True)
+
+    def close_gitlab_issue(self, gitlab_issue, project):
+        """
+        Close a GitLab issue after successful migration.
+
+        :param gitlab_issue: GitLab issue object.
+        :param project: GitLab project object.
+        """
+        try:
+            issue = project.issues.get(gitlab_issue.iid)
+            issue.state_event = "close"
+            issue.save()
+            logger.info(f"Closed GitLab issue #{gitlab_issue.iid}.")
+        except Exception as e:
+            logger.error(f"Error closing GitLab issue #{gitlab_issue.iid}: {e}", exc_info=True)
 
     def migrate_issues(self):
         """
@@ -793,10 +840,20 @@ class GitLabToJiraMigrator:
                 if key in self.issue_mapping:
                     logger.info(f"Skipping already migrated issue #{gitlab_issue.iid}")
                     continue
+                if self.skip_labels and self.skip_labels.intersection(gitlab_issue.labels):
+                    logger.info(f"Skipping issue #{gitlab_issue.iid} due to label filter: {self.skip_labels.intersection(gitlab_issue.labels)}")
+                    continue
+                if self.include_labels_only and not self.include_labels_only.intersection(gitlab_issue.labels):
+                    logger.info(f"Skipping issue #{gitlab_issue.iid}: no matching include labels")
+                    continue
                 logger.info(f"\n=== Processing GitLab issue #{gitlab_issue.iid} from project {full_project.id}: {gitlab_issue.title} ===")
                 jira_key = self.create_jira_issue(gitlab_issue, full_project)
                 if jira_key:
                     self.migrate_comments(gitlab_issue, jira_key, full_project)
+                    if self.mark_migrated:
+                        self.mark_gitlab_issue_as_migrated(gitlab_issue, full_project, jira_key)
+                    if self.close_issues:
+                        self.close_gitlab_issue(gitlab_issue, full_project)
 
 def main():
     parser = argparse.ArgumentParser(
@@ -812,6 +869,11 @@ def main():
     parser.add_argument("--jira-project-key", required=True, help="Jira project key")
     parser.add_argument("--jira-epic-key", help="Jira Epic key to assign parent issues (optional)", default=None)
     parser.add_argument("--mapping-file", help="File to store migration mapping", default="issue_mapping.json")
+    label_filter = parser.add_mutually_exclusive_group()
+    label_filter.add_argument("--skip-labels", nargs="+", metavar="LABEL", help="Skip issues that have any of these labels", default=[])
+    label_filter.add_argument("--include-labels-only", nargs="+", metavar="LABEL", help="Only migrate issues that have at least one of these labels", default=[])
+    parser.add_argument("--mark-migrated", action="store_true", help="Add 'imported-to-jira' label and a Jira link comment to each migrated GitLab issue")
+    parser.add_argument("--close-issues", action="store_true", help="Close each GitLab issue after successful migration")
 
     args = parser.parse_args()
 
@@ -825,7 +887,11 @@ def main():
         jira_epic_key=args.jira_epic_key,
         gitlab_project_id=args.gitlab_project_id,
         gitlab_group_id=args.gitlab_group_id,
-        mapping_file=args.mapping_file
+        mapping_file=args.mapping_file,
+        skip_labels=args.skip_labels,
+        include_labels_only=args.include_labels_only,
+        mark_migrated=args.mark_migrated,
+        close_issues=args.close_issues,
     )
 
     migrator.migrate_issues()
